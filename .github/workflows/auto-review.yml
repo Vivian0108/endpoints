@@ -1,8 +1,20 @@
 name: Auto Request Review
 
+# pull_request_target (not pull_request): GITHUB_TOKEN is read-only for PRs
+# opened from forks, and requesting reviewers needs pull-requests: write.
+# Runs in the base repo's context, so this workflow must never check out or
+# execute PR-provided code — it only reads PR metadata through the API.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: auto-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   auto-review:
@@ -28,11 +40,13 @@ jobs:
               'src/inference_endpoint/plugins/': ['nvzhihanj','arekay-nv'],
             };
 
-            // Get changed files
-            const { data: files } = await github.rest.pulls.listFiles({
+            // Get changed files (paginated: listFiles returns 30 per page by
+            // default, which would truncate large PRs)
+            const files = await github.paginate(github.rest.pulls.listFiles, {
               owner,
               repo,
               pull_number: number,
+              per_page: 100,
             });
 
             // Get PR author
@@ -59,12 +73,22 @@ jobs:
 
             // Request reviews
             if (reviewersToRequest.size > 0) {
-              await github.rest.pulls.requestReviewers({
-                owner,
-                repo,
-                pull_number: number,
-                reviewers: Array.from(reviewersToRequest),
-              });
-
-              console.log(`Requested review from: ${Array.from(reviewersToRequest).join(', ')}`);
+              const reviewers = Array.from(reviewersToRequest);
+              try {
+                await github.rest.pulls.requestReviewers({
+                  owner,
+                  repo,
+                  pull_number: number,
+                  reviewers,
+                });
+                console.log(`Requested review from: ${reviewers.join(', ')}`);
+              } catch (error) {
+                // 422 means a reviewer is not a collaborator; skip the request
+                // instead of failing the whole workflow.
+                if (error.status === 422) {
+                  core.warning(`Could not request review: ${error.message}`);
+                } else {
+                  throw error;
+                }
+              }
             }
